@@ -176,7 +176,7 @@ int main( int argc, char* argv[] )
 	unsigned char										detected = 0;
 	std::vector<Rect>								xim_ROI( XIM_NB_FEATURES );
 	std::vector<Mat>								xim_ROI_mat( XIM_NB_FEATURES );
-	std::vector<Point2f>						xim_cog( XIM_NB_FEATURES );
+	std::vector<Point2f>						xim_cog( XIM_NB_FEATURES );	
 	
 	// Initialize image buffer
 	memset( &image, 0, sizeof(image) );
@@ -398,11 +398,10 @@ int main( int argc, char* argv[] )
 						xim_ROI[i].width = cv_mat.cols - xim_ROI[i].x;
 					if ( xim_ROI[i].y + xim_ROI[i].height > cv_mat.rows )
 						xim_ROI[i].height = cv_mat.rows - xim_ROI[i].y;
-						
-					// Compute feature center of gravity
+					
+					// Extract feature center of gravity coordinates
 					xim_cog[i].x = keypoints[i].pt.x;
 					xim_cog[i].y = keypoints[i].pt.y;
-					
 				}
 			}
 			
