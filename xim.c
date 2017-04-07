@@ -1,4 +1,4 @@
-// xim : basic framework to handle XIMEA cameras with RPIt
+// xim : basic framework to handle XIMEA cameras with RPIt socket block
 // Compilation: make
 // OpenCV and XIAPI should be installed.
 // Performance tuning:
@@ -32,6 +32,12 @@
 #include <unistd.h>
 #include <time.h>
 #include <sys/time.h>
+#include <sys/types.h>
+#include <sys/socket.h>
+#include <netinet/tcp.h>
+#include <netdb.h>
+#include <signal.h>
+#include <pthread.h>
 #include <termios.h>
 #include <memory.h>
 #include <m3api/xiApi.h>
@@ -41,7 +47,36 @@
 #include "opencv2/imgproc.hpp"
 #include <opencv2/highgui/highgui.hpp>
 
-#define HandleResult(res,place) if (res!=XI_OK) {printf("Error after %s (%d).\n",place,res);goto finish;}
+// Socket handler definitions
+
+#define RPIT_SOCKET_CON_N					10			// Nb of double sent (control)
+#define RPIT_SOCKET_MES_N					10			// Nb of double returned (measurement)
+#define RPIT_SOCKET_PORT					"31415"	// Port of the server
+#define RPIT_SOCKET_MES_PERIOD		2000		// Sampling period of the measurement (us)
+#define RPIT_SOCKET_MAGIC					3141592	// Magic number
+#define RPIT_SOCKET_WATCHDOG_TRIG	1000000	// Delay in us before watchdog is triggered
+
+struct RPIt_socket_mes_struct	{
+	unsigned int				magic;							// Magic number
+	unsigned long long 	timestamp;					// Absolute server time in ns 
+	double							mes[RPIT_SOCKET_MES_N];	// Measurements
+};
+
+struct RPIt_socket_con_struct	{
+	unsigned int				magic;							// Magic number
+	unsigned long long 	timestamp;					// Absolute client time in ns
+	double							con[RPIT_SOCKET_CON_N];	// Control signals
+};
+
+pthread_t 												mes_thread;
+pthread_mutex_t 									mes_mutex;
+struct RPIt_socket_mes_struct			mes;
+struct RPIt_socket_con_struct			con;
+unsigned char											exit_req = 0;
+
+// Image processing definitions
+
+#define HandleResult(res,place) if (res!=XI_OK) {flockfile(stderr);fprintf(stderr,"XIAPI: error after %s (%d).\n",place,res);funlockfile(stderr);rpit_socket_cleanup( EXIT_FAILURE );}
 
 #define XIM_LIVE_VIDEO										// Live video on/off
 #define XIM_XIAPI_BUFFERS		3							// Number of frame buffers
@@ -69,8 +104,22 @@
 //#define XIM_BLOB_MIN_INER_R	0.01
 //#define XIM_BLOB_MAX_INER_R	0.1
 
-using namespace cv;
-using namespace std;
+XI_IMG 												image;
+HANDLE 												xiH = NULL;
+XI_RETURN 										stat = XI_OK;
+IplImage*											cv_image = NULL;
+
+using namespace 							cv;
+using namespace 							std;
+
+// Get system time
+void rpit_socket_get_time( struct timespec *ts )	{
+
+	if ( !ts )
+		return;
+
+	clock_gettime( CLOCK_MONOTONIC, ts );
+}
 
 // 
 // getch and kbhit
@@ -148,7 +197,9 @@ IplImage* xim_xiimg2cvipl( XI_IMG* xiimg )	{
 		case XI_RGB_PLANAR  : cvipl = cvCreateImage( cvSize( xiimg->width, xiimg->height ), IPL_DEPTH_8U, 3 );	break;
 		case XI_RGB32       : cvipl = cvCreateImage( cvSize( xiimg->width, xiimg->height ), IPL_DEPTH_8U, 4 ); break;
 		default :
-			printf( "xim_xiimg2cvipl error: unknown format.\n");
+			flockfile( stderr );
+			fprintf( stderr, "XIAPI: unknown format in xim_xiimg2cvipl.\n" );
+			funlockfile( stderr );
 			return NULL;
 		}
 	
@@ -158,10 +209,17 @@ IplImage* xim_xiimg2cvipl( XI_IMG* xiimg )	{
 	return cvipl;
 }
 
-int main( int argc, char* argv[] )
-{
-	XI_IMG 													image;
-	IplImage*												cv_image;
+//
+// MEASUREMENT THREAD. Runs asynchronously at a higher rate.
+//
+void *rpit_socket_server_update( void *ptr )	{
+	
+	struct timespec 								current_time, last_time;
+	unsigned long long							period;
+	unsigned long long							watchdog_counter = 0;
+	unsigned long long							last_timestamp = 0;
+	int															i;
+	
 	cv::Mat													cv_mat, cv_im_bin;
 	#ifdef XIM_LIVE_VIDEO
 	cv::Mat													im_with_keypoints;
@@ -170,149 +228,135 @@ int main( int argc, char* argv[] )
 	cv::SimpleBlobDetector::Params 	params;
 	cv::Ptr<cv::SimpleBlobDetector> detector;
 	std::vector<KeyPoint> 					keypoints, keypoints_ROI;
-	int															i;
-	struct timespec 								instant_1, instant_2;
-	unsigned long long							loop_duration = 0;
 	unsigned char										detected = 0;
 	std::vector<Rect>								xim_ROI( XIM_NB_FEATURES );
 	std::vector<Mat>								xim_ROI_mat( XIM_NB_FEATURES );
-	std::vector<Point2f>						xim_cog( XIM_NB_FEATURES );	
+	std::vector<Point2f>						xim_cog( XIM_NB_FEATURES );
 	
-	// Initialize image buffer
-	memset( &image, 0, sizeof(image) );
-	image.size = sizeof( XI_IMG );
-
-	// XIMEA API V4.05
-	HANDLE xiH = NULL;
-	XI_RETURN stat = XI_OK;
-
-	// Retrieving a handle to the camera device 
-	printf( "Opening first camera.\n" );
-	stat = xiOpenDevice( 0, &xiH );
-	HandleResult( stat, "xiOpenDevice" );
-
-	// Setting "exposure" parameter (us)
-	stat = xiSetParamInt( xiH, XI_PRM_EXPOSURE, XIM_EXPOSURE );
-	HandleResult( stat,"xiSetParam (exposure set)" );
 	
-	// Limit buffer size
-	stat = xiSetParamInt( xiH, XI_PRM_BUFFERS_QUEUE_SIZE, XIM_XIAPI_BUFFERS );
-	HandleResult( stat,"xiSetParam (buffers queue size)" );
+	rpit_socket_get_time( &last_time );
+	mes.magic = RPIT_SOCKET_MAGIC;
 	
-	// GetImage retrieves the most recent image
-	stat = xiSetParamInt( xiH, XI_PRM_RECENT_FRAME, 1 );
-	HandleResult( stat,"xiSetParam (recent frame)" );
+	// OpenCV initialization
 	
-	// Starting acquisition
-	printf( "Starting acquisition.\n" );
-	stat = xiStartAcquisition( xiH );
-	HandleResult( stat, "xiStartAcquisition" );
+	// Get XIAPI pointer to image
+	cv_image = xim_xiimg2cvipl( &image );
+	if ( cv_image == NULL )	{
+		flockfile( stderr );
+		fprintf( stderr, "XIAPI: error after xim_xiimg2cvipl (NULL).\n" );
+		funlockfile( stderr );
+		rpit_socket_cleanup( EXIT_FAILURE );
+		return NULL;
+	}
+	cv_mat = cv::cvarrToMat( cv_image );
 
-	// Get first image to detect format
-	stat = xiGetImage( xiH, XIM_TIMEOUT, &image );
-	HandleResult( stat, "xiGetImage" );
+	// Create video window
+	#ifdef XIM_LIVE_VIDEO
+	cv::namedWindow( XIM_VIDEO_NAME, WINDOW_AUTOSIZE );
+	#endif
+
+	// Define thresholds
+	params.minThreshold = XIM_BLOB_MIN_THRES;
+	params.maxThreshold = XIM_BLOB_MAX_THRES;
+	params.thresholdStep = XIM_BLOB_THRES_STEP;
 	
-	// Protect all OpenCV code with a try...catch
-	try	{
-		// Initialize OpenCV
-		cv_image = xim_xiimg2cvipl( &image );
-		if ( cv_image == NULL )	{
-			printf( "Error after xim_xiimg2cvipl (NULL).\n" );
-			goto finish;
-		}
-		cv_mat = cv::cvarrToMat( cv_image );
+	// Define Repeatability
+	params.minRepeatability = 0;
+	
+	// Define min distance
+	params.minDistBetweenBlobs = XIM_BLOB_MIN_DIST;
+	
+	// Filter by color: 0-> dark blob; 255->bright blob
+	#ifdef XIM_BLOB_COLOR
+	params.filterByColor = true;
+	params.blobColor = XIM_BLOB_COLOR;
+	#else
+	params.filterByColor = false;
+	#endif
 
-		// Create video window
-		#ifdef XIM_LIVE_VIDEO
-		cv::namedWindow( XIM_VIDEO_NAME, WINDOW_AUTOSIZE );
-		#endif
+	// Filter by Area.
+	#ifdef XIM_BLOB_MIN_AREA
+	params.filterByArea = true;
+	params.minArea = XIM_BLOB_MIN_AREA;
+	#ifdef XIM_BLOB_MAX_AREA
+	params.maxArea = XIM_BLOB_MAX_AREA;
+	#endif
+	#else
+	params.filterByArea = false;
+	#endif
 
-		// Define thresholds
-		params.minThreshold = XIM_BLOB_MIN_THRES;
-		params.maxThreshold = XIM_BLOB_MAX_THRES;
-		params.thresholdStep = XIM_BLOB_THRES_STEP;
+	// Filter by Circularity
+	#ifdef XIM_BLOB_MIN_CIRC
+	params.filterByCircularity = true;
+	params.minCircularity = XIM_BLOB_MIN_CIRC;
+	#ifdef XIM_BLOB_MAX_CIRC
+	params.maxCircularity = XIM_BLOB_MAX_CIRC;
+	#endif
+	#else
+	params.filterByCircularity = false;
+	#endif
+
+	// Filter by Convexity
+	#ifdef XIM_BLOB_MIN_CONVEX
+	params.filterByConvexity = true;
+	params.minConvexity = XIM_BLOB_MIN_CONVEX;
+	#ifdef XIM_BLOB_MAX_CONVEX
+	params.maxConvexity = XIM_BLOB_MAX_CONVEX;
+	#endif
+	#else
+	params.filterByConvexity = false;
+	#endif
+
+	// Filter by Inertia
+	#ifdef XIM_BLOB_MIN_INER_R
+	params.filterByInertia = true;
+	params.minInertiaRatio = XIM_BLOB_MIN_INER_R;
+	#ifdef XIM_BLOB_MAX_INER_R
+	params.maxInertiaRatio = XIM_BLOB_MAX_INER_R;
+	#endif
+	#else
+	params.filterByInertia = false;	
+	#endif
+	
+	// Create blob detector
+	detector = cv::SimpleBlobDetector::create( params );
+	
+	while( 1 )	{
 		
-		// Define Repeatability
-		params.minRepeatability = 0;
+		/* Check if exit is requested */
 		
-		// Define min distance
-		params.minDistBetweenBlobs = XIM_BLOB_MIN_DIST;
+		if ( exit_req )
+			break;
 		
-		// Filter by color: 0-> dark blob; 255->bright blob
-		#ifdef XIM_BLOB_COLOR
-		params.filterByColor = true;
-		params.blobColor = XIM_BLOB_COLOR;
-		#else
-		params.filterByColor = false;
-		#endif
-
-		// Filter by Area.
-		#ifdef XIM_BLOB_MIN_AREA
-		params.filterByArea = true;
-		params.minArea = XIM_BLOB_MIN_AREA;
-		#ifdef XIM_BLOB_MAX_AREA
-		params.maxArea = XIM_BLOB_MAX_AREA;
-		#endif
-		#else
-		params.filterByArea = false;
-		#endif
-
-		// Filter by Circularity
-		#ifdef XIM_BLOB_MIN_CIRC
-		params.filterByCircularity = true;
-		params.minCircularity = XIM_BLOB_MIN_CIRC;
-		#ifdef XIM_BLOB_MAX_CIRC
-		params.maxCircularity = XIM_BLOB_MAX_CIRC;
-		#endif
-		#else
-		params.filterByCircularity = false;
-		#endif
-
-		// Filter by Convexity
-		#ifdef XIM_BLOB_MIN_CONVEX
-		params.filterByConvexity = true;
-		params.minConvexity = XIM_BLOB_MIN_CONVEX;
-		#ifdef XIM_BLOB_MAX_CONVEX
-		params.maxConvexity = XIM_BLOB_MAX_CONVEX;
-		#endif
-		#else
-		params.filterByConvexity = false;
-		#endif
-
-		// Filter by Inertia
-		#ifdef XIM_BLOB_MIN_INER_R
-		params.filterByInertia = true;
-		params.minInertiaRatio = XIM_BLOB_MIN_INER_R;
-		#ifdef XIM_BLOB_MAX_INER_R
-		params.maxInertiaRatio = XIM_BLOB_MAX_INER_R;
-		#endif
-		#else
-		params.filterByInertia = false;	
-		#endif
+		/* Get current time */
 		
-		// Create blob detector
-		detector = cv::SimpleBlobDetector::create( params );
+		rpit_socket_get_time( &current_time );
 		
-		// Get current time
-		clock_gettime( CLOCK_MONOTONIC, &instant_1 );
+		/* Critical section */
+		
+		pthread_mutex_lock( &mes_mutex );	
+		
+		mes.timestamp = (unsigned long long)current_time.tv_sec * 1000000000
+									+ (unsigned long long)current_time.tv_nsec;
+		
+		/* 
+		 * 
+		 * 
+		 * Insert the measurements acquisition code here.
+		 * This code can used control signals safely:
+		 * they are protected by a mutex.
+		 * 
+		 * 
+		 * 
+		 */
+		
+		// Protect all OpenCV code with a try...catch
+		
+		try	{
 			
-		// Acquisition loop
-		while( 1 )
-		{
 			// Getting image from camera
 			stat = xiGetImage( xiH, XIM_TIMEOUT, &image );
 			HandleResult( stat, "xiGetImage" );
-			
-			// Get current time
-			clock_gettime( CLOCK_MONOTONIC, &instant_2 );
-			
-			// Caluclate loop duration (us)
-			loop_duration = 	( instant_2.tv_sec - instant_1.tv_sec ) * 1000000 +
-												( instant_2.tv_nsec - instant_1.tv_nsec ) / 1000;
-			printf( "Loop duration: %llu us\n", loop_duration );
-			
-			// Switch variable for next iteration
-			memcpy( &instant_1, &instant_2, sizeof( struct timespec ) );
 			
 			// Update CV image
 			cv_image->imageData=(char*)image.bp;
@@ -326,7 +370,9 @@ int main( int argc, char* argv[] )
 				// Global blob detection
 				detector->detect( cv_im_bin, keypoints );
 				if ( keypoints.size() == XIM_NB_FEATURES )	{
-					printf( "Detect blobs: all features detected.\n" );
+					flockfile( stdout );
+					printf( "OpenCV: all features detected.\n" );
+					funlockfile( stdout );
 					// Initializing ROIs
 					for ( i = 0; i < XIM_NB_FEATURES; i++ )	{
 						xim_ROI[i].x = keypoints[i].pt.x - ( keypoints[i].size * ( 1.0 + XIM_ROI_MARGIN / 100.0 ) ) / 2.0;
@@ -348,13 +394,19 @@ int main( int argc, char* argv[] )
 					detected = 1;
 				}
 				else
-					printf( "Detect blobs: missing features.\n" );
+				{
+					flockfile( stderr );
+					fprintf( stderr, "OpenCV: missing features.\n" );
+					funlockfile( stderr );
+				}
 			}
 			
 			// If features are localized, switch to tracking mode
 			if ( detected )
-			{
-				printf( "Feature tracking mode.\n" );
+			{	
+				flockfile( stout );
+				printf( "OpenCV: feature tracking mode.\n" );
+				funlockfile( stdout );
 				
 				// Detect blob in ROIs
 				for ( i = 0; i < XIM_NB_FEATURES; i++ )	{
@@ -370,12 +422,16 @@ int main( int argc, char* argv[] )
 					
 					// Error handling
 					if ( keypoints_ROI.size() == 0 )	{
-						printf( "No feature in ROI #%d!\n", i );
+						flockfile( stderr );
+						fprintf( stderr, "OpenCV: no feature in ROI #%d!\n", i );
+						funlockfile( stderr );
 						detected = 0;
 						break;
 					}
 					if ( keypoints_ROI.size() > 1 )	{
-						printf( "More than 1 feature in ROI #%d!\n", i );
+						flockfile( stderr );
+						fprintf( stderr, "OpenCV: more than 1 feature in ROI #%d!\n", i );
+						funlockfile( stderr );
 					}
 					
 					// Update keypoint
@@ -423,36 +479,313 @@ int main( int argc, char* argv[] )
 				
 				// Exit if key pressed + let the time for the image to be displayed
 				if ( cvWaitKey( XIM_EXPOSURE / 1000 ) != -1 )
-					break;
-				}
+					rpit_socket_cleanup( EXIT_SUCCESS );
+			}
 			#else
 			// Exit if key pressed
 			if ( kbhit( ) )
-				break;
+				rpit_socket_cleanup( EXIT_SUCCESS );
 			#endif
 		}
+		
+		catch( cv::Exception& e )
+		{
+			const char* err_msg = e.what();
+			
+			flockfile( stderr );
+			fprintf( stderr, "OpenCV: exception caught >> %s\n", err_msg );
+			funlockfile( stderr );
+			rpit_socket_cleanup( EXIT_FAILURE );
+		}
+
+		/**********************************************/
+		
+		/* Update measurements when features are detected */
+		
+		if ( detected )	{
+			for( i = 0; ( i < XIM_NB_FEATURES ) || ( i < RPIT_SOCKET_MES_N ); i++ )	{
+				mes.mes[2*i] = xim_cog[i].x;
+				mes.mes[2*i+1] = xim_cog[i].y;
+			}
+		}
+		
+		/* Whatchdog: if control signals are not updated, force them to 0 */
+		
+		if ( last_timestamp == con.timestamp )
+			watchdog_counter++;
+		else
+			watchdog_counter = 0;
+		
+		last_timestamp = con.timestamp;
+		
+		if ( watchdog_counter >= ( RPIT_SOCKET_WATCHDOG_TRIG / RPIT_SOCKET_MES_PERIOD ) )	{
+			
+			flockfile( stderr );
+			fprintf( stderr, "rpit_socket_server_update: watchdog triggered (%ds).\n",
+												(int)( ( watchdog_counter * RPIT_SOCKET_MES_PERIOD ) / 1000000 ) );
+			funlockfile( stderr );
+			
+			for( i = 0; i < RPIT_SOCKET_CON_N; i++ )
+				con.con[i] = 0.0;
+		}
+	
+		pthread_mutex_unlock( &mes_mutex );	
+		
+		/* Display period */
+		
+		period = mes.timestamp - ( (unsigned long long)last_time.tv_sec * 1000000000
+														 + (unsigned long long)last_time.tv_nsec );
+		last_time = current_time;
+		
+		flockfile( stderr );
+		fprintf( stderr, "rpit_socket_server_update: period duration = %llu us.\n", period / 1000 );
+		funlockfile( stderr );
 	}
 	
-	catch( cv::Exception& e )
-	{
-    const char* err_msg = e.what();
-    std::cout << "Exception caught: " << err_msg << std::endl;
-	}
+	return NULL;
+}
+
+// Cleanup code
+void rpit_socket_cleanup( int exit_code )	{
 	
-	// Shortcut in case of error
-	finish:
-	
-	// Cleanup
-	printf( "Stopping acquisition.\n" );
 	#ifdef XIM_LIVE_VIDEO
 	destroyWindow( XIM_VIDEO_NAME );
 	#endif
-	cvReleaseImage(	&cv_image	);
-	xiStopAcquisition( xiH );
-	xiCloseDevice( xiH );
+	
+	if ( cv_image != NULL )
+		cvReleaseImage(	&cv_image	);
+		
+	if ( xiH != NULL )	{
+		xiStopAcquisition( xiH );
+		xiCloseDevice( xiH );
+	}
+	
+	exit( exit_code );
+}
 
-	printf("Done.\n");
+// SIGINT handler : performs the cleanup
+void rpit_socket_server_int_handler( int dummy )	{
+	
+	/* Request termination of the thread */
+	
+	exit_req = 1;
+	
+	/* Wait for thread to terminate */
+	
+	pthread_join( mes_thread, NULL );
+	
+	flockfile( stderr );
+	fprintf( stderr, "\nrpit_socket_server_int_handler: measurement thread stopped. Cleaning up...\n" );
+	funlockfile( stderr );
+	
+	/* Cleanup */
+	
+	rpit_socket_cleanup( EXIT_SUCCESS );
 
-	return 0;
+}
+
+int main( int argc, char* argv[] )
+{
+	struct addrinfo 								hints;
+	struct addrinfo 								*result, *rp;
+	int 														sfd, s, i;
+	struct sockaddr_storage 				peer_addr;
+	socklen_t 											peer_addr_len;
+	ssize_t 												nread;
+	struct RPIt_socket_mes_struct		local_mes;
+	struct RPIt_socket_con_struct		local_con;
+	
+	/* 
+	 * 
+	 * 
+	 * XIAPI initialization
+	 * 
+	 * 
+	 * 
+	 */
+	
+	// Initialize image buffer
+	memset( &image, 0, sizeof(image) );
+	image.size = sizeof( XI_IMG );
+
+	// Retrieving a handle to the camera device 
+	printf( "XIAPI: Opening first camera.\n" );
+	stat = xiOpenDevice( 0, &xiH );
+	HandleResult( stat, "xiOpenDevice" );
+
+	// Setting "exposure" parameter (us)
+	stat = xiSetParamInt( xiH, XI_PRM_EXPOSURE, XIM_EXPOSURE );
+	HandleResult( stat,"xiSetParam (exposure set)" );
+	
+	// Limit buffer size
+	stat = xiSetParamInt( xiH, XI_PRM_BUFFERS_QUEUE_SIZE, XIM_XIAPI_BUFFERS );
+	HandleResult( stat,"xiSetParam (buffers queue size)" );
+	
+	// GetImage retrieves the most recent image
+	stat = xiSetParamInt( xiH, XI_PRM_RECENT_FRAME, 1 );
+	HandleResult( stat,"xiSetParam (recent frame)" );
+	
+	// Starting acquisition
+	printf( "XIAPI: Starting acquisition.\n" );
+	stat = xiStartAcquisition( xiH );
+	HandleResult( stat, "xiStartAcquisition" );
+
+	// Get first image to detect format
+	stat = xiGetImage( xiH, XIM_TIMEOUT, &image );
+	HandleResult( stat, "xiGetImage" );
+
+	/**********************************************/
+	
+	/* Initialize mutex */
+	
+	pthread_mutex_init( &mes_mutex, NULL );
+	
+	/* Clear mes structure */
+	
+	mes.timestamp = 0;
+	for ( i = 0; i < RPIT_SOCKET_MES_N; i++ )
+		mes.mes[i] = 0.0;
+	
+	/* Clear con structure */
+	
+	con.magic = 0;
+	con.timestamp = 0;
+	for ( i = 0; i < RPIT_SOCKET_CON_N; i++ )
+		con.con[i] = 0.0;
+	
+	/* Initialize SIGINT handler */
+	
+	signal( SIGINT, rpit_socket_server_int_handler );
+	
+	memset( &hints, 0, sizeof( struct addrinfo ) );
+	hints.ai_family = AF_UNSPEC;    /* Allow IPv4 or IPv6 */
+	hints.ai_socktype = SOCK_DGRAM; /* Datagram socket */
+	hints.ai_flags = AI_PASSIVE;    /* For wildcard IP address */
+	hints.ai_protocol = 0;					/* Any protocol */
+	hints.ai_canonname = NULL;
+	hints.ai_addr = NULL;
+	hints.ai_next = NULL;
+
+	s = getaddrinfo( NULL, RPIT_SOCKET_PORT, &hints, &result );
+	
+	if ( s != 0 ) {
+		flockfile( stderr );
+		fprintf( stderr, "rpit_socket_server: function getaddrinfo returned: %s\n", gai_strerror( s ) );
+		funlockfile( stderr );
+		rpit_socket_cleanup( EXIT_FAILURE );
+	 }
+	 
+	/* 	
+		getaddrinfo() returns a list of address structures.
+		Try each address until we successfully bind(2).
+		If socket(2) (or bind(2)) fails, we (close the socket
+		and) try the next address. 
+	*/
+
+	for ( rp = result; rp != NULL; rp = rp->ai_next ) {
+		sfd = socket( rp->ai_family, rp->ai_socktype, rp->ai_protocol );
+		if ( sfd == -1 )
+			continue;
+
+		if ( bind( sfd, rp->ai_addr, rp->ai_addrlen ) == 0 )
+			break;									/* Success */
+
+		close( sfd );
+	}
+
+	if ( rp == NULL ) {					/* No address succeeded */
+		flockfile( stderr );
+		fprintf( stderr, "rpit_socket_server: could not bind. Aborting.\n" );
+		funlockfile( stderr );
+		exit( EXIT_FAILURE );
+	}
+
+	freeaddrinfo( result );			/* No longer needed */ 
+	
+	/* Start measurement thread */
+	
+	pthread_create( &mes_thread, NULL, rpit_socket_server_update, (void*) NULL );
+	
+	/* Wait for control datagram and answer measurement to sender */
+
+	while ( 1 ) {
+		
+		/* Read control signals from the socket */
+		
+		peer_addr_len = sizeof( struct sockaddr_storage );
+		nread = recvfrom(	sfd, (char*)&local_con, sizeof( struct RPIt_socket_con_struct ), 0,
+											(struct sockaddr *)&peer_addr, &peer_addr_len );
+		
+		/* Memcopy is faster than socket read: avoid holding the mutex too long */
+		
+		pthread_mutex_lock( &mes_mutex );
+		
+		memcpy( &con, &local_con, sizeof( struct RPIt_socket_con_struct ) );
+		
+		if ( nread == -1 )	{
+			flockfile( stderr );
+			fprintf( stderr, "rpit_socket_server: function recvfrom exited with error.\n" );
+			funlockfile( stderr );
+			
+			/* Clear control in case of error */
+			
+			for ( i = 0; i < RPIT_SOCKET_CON_N; i++ )
+				con.con[i] = 0.0;
+		}
+		
+		if ( nread != sizeof( struct RPIt_socket_con_struct ) )	{
+			flockfile( stderr );
+			fprintf( stderr, "rpit_socket_server: function recvfrom did not receive the expected packet size.\n" );
+			funlockfile( stderr );
+			
+			/* Clear control in case of error */
+			
+			for ( i = 0; i < RPIT_SOCKET_CON_N; i++ )
+				con.con[i] = 0.0;
+		}
+										
+		if ( con.magic != RPIT_SOCKET_MAGIC )	{
+			flockfile( stderr );
+			fprintf( stderr, "rpit_socket_server: magic number problem. Expected %d but received %d.\n", RPIT_SOCKET_MAGIC, con.magic );
+			funlockfile( stderr );
+			
+			/* Clear control in case of error */
+			
+			for ( i = 0; i < RPIT_SOCKET_CON_N; i++ )
+				con.con[i] = 0.0;
+		}
+		
+		pthread_mutex_unlock( &mes_mutex );
+		
+		/*
+		 * 
+		 * 
+		 *	Insert here the handling of control signals.
+		 * 
+		 * 
+		 * 
+		 */
+		 
+
+		/**********************************************/
+		
+		/* Critical section : copy of the measurements to a local variable */
+		
+		pthread_mutex_lock( &mes_mutex );
+		memcpy( &local_mes, &mes, sizeof( struct RPIt_socket_mes_struct ) );
+		pthread_mutex_unlock( &mes_mutex );	
+		
+		/* Send measurements to the socket */
+		
+		if ( sendto(	sfd, (char*)&local_mes, sizeof( struct RPIt_socket_mes_struct ), 0,
+									(struct sockaddr *)&peer_addr,
+									peer_addr_len) != sizeof( struct RPIt_socket_mes_struct ) )	{
+			flockfile( stderr );
+			fprintf( stderr, "rpit_socket_server: error sending measurements.\n" );
+			funlockfile( stderr );
+		}		
+	}
+		
+	exit( EXIT_SUCCESS );
 }
 
