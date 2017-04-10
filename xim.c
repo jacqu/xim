@@ -112,6 +112,24 @@ IplImage*											cv_image = NULL;
 using namespace 							cv;
 using namespace 							std;
 
+// Cleanup code
+void rpit_socket_cleanup( int exit_code )	{
+	
+	#ifdef XIM_LIVE_VIDEO
+	destroyWindow( XIM_VIDEO_NAME );
+	#endif
+	
+	if ( cv_image != NULL )
+		cvReleaseImage(	&cv_image	);
+		
+	if ( xiH != NULL )	{
+		xiStopAcquisition( xiH );
+		xiCloseDevice( xiH );
+	}
+	
+	exit( exit_code );
+}
+
 // Get system time
 void rpit_socket_get_time( struct timespec *ts )	{
 
@@ -404,7 +422,7 @@ void *rpit_socket_server_update( void *ptr )	{
 			// If features are localized, switch to tracking mode
 			if ( detected )
 			{	
-				flockfile( stout );
+				flockfile( stdout );
 				printf( "OpenCV: feature tracking mode.\n" );
 				funlockfile( stdout );
 				
@@ -543,24 +561,6 @@ void *rpit_socket_server_update( void *ptr )	{
 	}
 	
 	return NULL;
-}
-
-// Cleanup code
-void rpit_socket_cleanup( int exit_code )	{
-	
-	#ifdef XIM_LIVE_VIDEO
-	destroyWindow( XIM_VIDEO_NAME );
-	#endif
-	
-	if ( cv_image != NULL )
-		cvReleaseImage(	&cv_image	);
-		
-	if ( xiH != NULL )	{
-		xiStopAcquisition( xiH );
-		xiCloseDevice( xiH );
-	}
-	
-	exit( exit_code );
 }
 
 // SIGINT handler : performs the cleanup
