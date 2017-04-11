@@ -78,7 +78,7 @@ unsigned char											exit_req = 0;
 
 #define HandleResult(res,place) if (res!=XI_OK) {flockfile(stderr);fprintf(stderr,"XIAPI: error after %s (%d).\n",place,res);funlockfile(stderr);rpit_socket_cleanup( EXIT_FAILURE );}
 
-#define XIM_LIVE_VIDEO										// Live video on/off
+//#define XIM_LIVE_VIDEO										// Live video on/off
 #define XIM_XIAPI_BUFFERS		3							// Number of frame buffers
 #define XIM_VIDEO_FSKIP			20						// Live video frame subsampling
 #define XIM_EXPOSURE				1800					// us
@@ -232,8 +232,8 @@ IplImage* xim_xiimg2cvipl( XI_IMG* xiimg )	{
 //
 void *rpit_socket_server_update( void *ptr )	{
 	
-	struct timespec 								current_time, last_time;
-	unsigned long long							period;
+	struct timespec 								current_time, last_time, comp_time;
+	unsigned long long							period, comput;
 	unsigned long long							watchdog_counter = 0;
 	unsigned long long							last_timestamp = 0;
 	int															i;
@@ -344,18 +344,7 @@ void *rpit_socket_server_update( void *ptr )	{
 		/* Check if exit is requested */
 		
 		if ( exit_req )
-			break;
-		
-		/* Get current time */
-		
-		rpit_socket_get_time( &current_time );
-		
-		/* Critical section */
-		
-		pthread_mutex_lock( &mes_mutex );	
-		
-		mes.timestamp = (unsigned long long)current_time.tv_sec * 1000000000
-									+ (unsigned long long)current_time.tv_nsec;
+			break;	
 		
 		/* 
 		 * 
@@ -367,15 +356,24 @@ void *rpit_socket_server_update( void *ptr )	{
 		 * 
 		 * 
 		 */
+			
+		// Getting image from camera
+		stat = xiGetImage( xiH, XIM_TIMEOUT, &image );
+		HandleResult( stat, "xiGetImage" );
+		
+		// Enter critical section
+	
+		pthread_mutex_lock( &mes_mutex );	
+
+		// Get current time
+		rpit_socket_get_time( &current_time );
+		mes.timestamp = (unsigned long long)current_time.tv_sec * 1000000000
+									+ (unsigned long long)current_time.tv_nsec;
 		
 		// Protect all OpenCV code with a try...catch
 		
 		try	{
-			
-			// Getting image from camera
-			stat = xiGetImage( xiH, XIM_TIMEOUT, &image );
-			HandleResult( stat, "xiGetImage" );
-			
+
 			// Update CV image
 			cv_image->imageData=(char*)image.bp;
 			cv_mat = cv::cvarrToMat( cv_image );
@@ -418,7 +416,7 @@ void *rpit_socket_server_update( void *ptr )	{
 					funlockfile( stderr );
 				}
 			}
-			
+
 			// If features are localized, switch to tracking mode
 			if ( detected )
 			{	
@@ -478,7 +476,7 @@ void *rpit_socket_server_update( void *ptr )	{
 					xim_cog[i].y = keypoints[i].pt.y;
 				}
 			}
-			
+
 			#ifdef XIM_LIVE_VIDEO
 			// Display image at desired fps
 			if ( !( frame_cnt++ % XIM_VIDEO_FSKIP ) )	{
@@ -505,7 +503,6 @@ void *rpit_socket_server_update( void *ptr )	{
 				rpit_socket_cleanup( EXIT_SUCCESS );
 			#endif
 		}
-		
 		catch( cv::Exception& e )
 		{
 			const char* err_msg = e.what();
@@ -517,24 +514,24 @@ void *rpit_socket_server_update( void *ptr )	{
 		}
 
 		/**********************************************/
-		
+
 		/* Update measurements when features are detected */
 		
 		if ( detected )	{
-			for( i = 0; ( i < XIM_NB_FEATURES ) || ( i < RPIT_SOCKET_MES_N ); i++ )	{
+			for( i = 0; ( i < XIM_NB_FEATURES ) && ( 2*i+1 < RPIT_SOCKET_MES_N ); i++ )	{
 				mes.mes[2*i] = xim_cog[i].x;
 				mes.mes[2*i+1] = xim_cog[i].y;
 			}
 		}
-		
+
 		/* Whatchdog: if control signals are not updated, force them to 0 */
-		
-		if ( last_timestamp == con.timestamp )
-			watchdog_counter++;
-		else
+
+		if ( last_timestamp != con.timestamp )	{
 			watchdog_counter = 0;
-		
-		last_timestamp = con.timestamp;
+			last_timestamp = con.timestamp;
+		}
+		else
+			watchdog_counter++;
 		
 		if ( watchdog_counter >= ( RPIT_SOCKET_WATCHDOG_TRIG / RPIT_SOCKET_MES_PERIOD ) )	{
 			
@@ -549,15 +546,21 @@ void *rpit_socket_server_update( void *ptr )	{
 	
 		pthread_mutex_unlock( &mes_mutex );	
 		
-		/* Display period */
+		/* Display timing stats */
+		
+		rpit_socket_get_time( &comp_time );
+		
+		comput =  ( (unsigned long long)comp_time.tv_sec * 1000000000
+							+ (unsigned long long)comp_time.tv_nsec ) - mes.timestamp;
 		
 		period = mes.timestamp - ( (unsigned long long)last_time.tv_sec * 1000000000
 														 + (unsigned long long)last_time.tv_nsec );
 		last_time = current_time;
 		
-		flockfile( stderr );
-		fprintf( stderr, "rpit_socket_server_update: period duration = %llu us.\n", period / 1000 );
-		funlockfile( stderr );
+		flockfile( stdout );
+		printf( "rpit_socket_server_update: period duration = %llu us.\n", period / 1000 );
+		printf( "rpit_socket_server_update: cpu usage = %d percent.\n", (int)( (double)comput / (double)period * 100.0 ) );
+		funlockfile( stdout );
 	}
 	
 	return NULL;
@@ -754,7 +757,7 @@ int main( int argc, char* argv[] )
 			for ( i = 0; i < RPIT_SOCKET_CON_N; i++ )
 				con.con[i] = 0.0;
 		}
-		
+
 		pthread_mutex_unlock( &mes_mutex );
 		
 		/*
@@ -783,7 +786,7 @@ int main( int argc, char* argv[] )
 			flockfile( stderr );
 			fprintf( stderr, "rpit_socket_server: error sending measurements.\n" );
 			funlockfile( stderr );
-		}		
+		}
 	}
 		
 	exit( EXIT_SUCCESS );
