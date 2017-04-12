@@ -22,7 +22,11 @@
 //		echo '@realtime - nice   -16' | sudo tee -a /etc/security/limits.d/ximea.conf > /dev/null
 //		sudo gpasswd -a "$(whoami)" realtime
 //
+//	For optimal reading, set tab size = 2 in your editor.
+//
 // JG, 30.03.17
+
+//#define XIM_OPENCV_VER3										// Set this flag to compile with OpenCV 3.x
 
 #include <stdio.h>
 #include <fcntl.h>
@@ -42,10 +46,17 @@
 #include <memory.h>
 #include <m3api/xiApi.h>
 #include <iostream>
+#ifdef XIM_OPENCV_VER3
 #include <opencv2/core.hpp> 
 #include <opencv2/features2d.hpp>
 #include "opencv2/imgproc.hpp"
 #include <opencv2/highgui/highgui.hpp>
+#else
+#include <opencv2/core/core.hpp> 
+#include <opencv2/features2d/features2d.hpp>
+#include <opencv2/imgproc/imgproc.hpp>
+#include <opencv2/highgui/highgui.hpp>
+#endif
 
 // Socket handler definitions
 
@@ -78,7 +89,8 @@ unsigned char											exit_req = 0;
 
 #define HandleResult(res,place) if (res!=XI_OK) {flockfile(stderr);fprintf(stderr,"XIAPI: error after %s (%d).\n",place,res);funlockfile(stderr);rpit_socket_cleanup( EXIT_FAILURE );}
 
-//#define XIM_LIVE_VIDEO										// Live video on/off
+#define XIM_LIVE_VIDEO										// Live video on/off
+
 #define XIM_XIAPI_BUFFERS		3							// Number of frame buffers
 #define XIM_VIDEO_FSKIP			20						// Live video frame subsampling
 #define XIM_EXPOSURE				1800					// us
@@ -97,8 +109,8 @@ unsigned char											exit_req = 0;
 #define XIM_BLOB_COLOR			255
 #define XIM_BLOB_MIN_AREA		150.0
 #define XIM_BLOB_MAX_AREA		8000.0
-//#define XIM_BLOB_MIN_CIRC		0.5
-//#define XIM_BLOB_MAX_CIRC		1.0
+#define XIM_BLOB_MIN_CIRC		0.5
+#define XIM_BLOB_MAX_CIRC		1.0
 //#define XIM_BLOB_MIN_CONVEX	0.87
 //#define XIM_BLOB_MAX_CONVEX	1.0
 //#define XIM_BLOB_MIN_INER_R	0.01
@@ -244,7 +256,9 @@ void *rpit_socket_server_update( void *ptr )	{
 	unsigned long long							frame_cnt = 0;
 	#endif
 	cv::SimpleBlobDetector::Params 	params;
+	#ifdef XIM_OPENCV_VER3
 	cv::Ptr<cv::SimpleBlobDetector> detector;
+	#endif
 	std::vector<KeyPoint> 					keypoints, keypoints_ROI;
 	unsigned char										detected = 0;
 	std::vector<Rect>								xim_ROI( XIM_NB_FEATURES );
@@ -337,7 +351,11 @@ void *rpit_socket_server_update( void *ptr )	{
 	#endif
 	
 	// Create blob detector
+	#ifdef XIM_OPENCV_VER3
 	detector = cv::SimpleBlobDetector::create( params );
+	#else
+	cv::SimpleBlobDetector detector( params );
+	#endif
 	
 	while( 1 )	{
 		
@@ -384,13 +402,20 @@ void *rpit_socket_server_update( void *ptr )	{
 				// Image binarization
 				cv::threshold( cv_mat, cv_im_bin, 0, 255, CV_THRESH_BINARY | CV_THRESH_OTSU );
 				// Global blob detection
+				#ifdef XIM_OPENCV_VER3
 				detector->detect( cv_im_bin, keypoints );
+				#else
+				detector.detect( cv_im_bin, keypoints );
+				#endif
 				if ( keypoints.size() == XIM_NB_FEATURES )	{
 					flockfile( stdout );
 					printf( "OpenCV: all features detected.\n" );
 					funlockfile( stdout );
 					// Initializing ROIs
 					for ( i = 0; i < XIM_NB_FEATURES; i++ )	{
+						#ifndef XIM_OPENCV_VER3
+						keypoints[i].size *= 2.0;
+						#endif
 						xim_ROI[i].x = keypoints[i].pt.x - ( keypoints[i].size * ( 1.0 + XIM_ROI_MARGIN / 100.0 ) ) / 2.0;
 						xim_ROI[i].y = keypoints[i].pt.y - ( keypoints[i].size * ( 1.0 + XIM_ROI_MARGIN / 100.0 ) ) / 2.0;
 						xim_ROI[i].width = keypoints[i].size * ( 1.0 + XIM_ROI_MARGIN / 100.0 );
@@ -434,7 +459,11 @@ void *rpit_socket_server_update( void *ptr )	{
 					cv::threshold( xim_ROI_mat[i], cv_im_bin, 0, 255, CV_THRESH_BINARY | CV_THRESH_OTSU );
 					
 					// Blob detection in ROI
+					#ifdef XIM_OPENCV_VER3
 					detector->detect( cv_im_bin, keypoints_ROI );
+					#else
+					detector.detect( cv_im_bin, keypoints_ROI );
+					#endif
 					
 					// Error handling
 					if ( keypoints_ROI.size() == 0 )	{
@@ -452,10 +481,13 @@ void *rpit_socket_server_update( void *ptr )	{
 					
 					// Update keypoint
 					keypoints[i] = keypoints_ROI[0];
-					
-					// Update ROI
 					keypoints[i].pt.x += xim_ROI[i].x;
 					keypoints[i].pt.y += xim_ROI[i].y;
+					#ifndef XIM_OPENCV_VER3
+					keypoints[i].size *= 2.0;
+					#endif
+					
+					// Update ROI
 					xim_ROI[i].x = keypoints[i].pt.x - ( keypoints[i].size * ( 1.0 + XIM_ROI_MARGIN / 100.0 ) ) / 2.0;
 					xim_ROI[i].y = keypoints[i].pt.y - ( keypoints[i].size * ( 1.0 + XIM_ROI_MARGIN / 100.0 ) ) / 2.0;
 					xim_ROI[i].width = keypoints[i].size * ( 1.0 + XIM_ROI_MARGIN / 100.0 );
