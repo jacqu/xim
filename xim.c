@@ -27,6 +27,7 @@
 // JG, 30.03.17
 
 //#define XIM_OPENCV_VER3										// Set this flag to compile with OpenCV 3.x
+#define XIM_LIVE_VIDEO										// Live video on/off
 
 #include <stdio.h>
 #include <fcntl.h>
@@ -44,12 +45,14 @@
 #include <pthread.h>
 #include <termios.h>
 #include <memory.h>
-#include <m3api/xiApi.h>
 #include <iostream>
+#ifdef XIM_USE_XIMEA
+#include <m3api/xiApi.h>
+#endif
 #ifdef XIM_OPENCV_VER3
 #include <opencv2/core.hpp> 
 #include <opencv2/features2d.hpp>
-#include "opencv2/imgproc.hpp"
+#include <opencv2/imgproc.hpp>
 #include <opencv2/highgui/highgui.hpp>
 #else
 #include <opencv2/core/core.hpp> 
@@ -58,12 +61,17 @@
 #include <opencv2/highgui/highgui.hpp>
 #endif
 
+// Namespace definition
+
+using namespace 							cv;
+using namespace 							std;
+
 // Socket handler definitions
 
 #define RPIT_SOCKET_CON_N					10			// Nb of double sent (control)
 #define RPIT_SOCKET_MES_N					10			// Nb of double returned (measurement)
 #define RPIT_SOCKET_PORT					"31415"	// Port of the server
-#define RPIT_SOCKET_MES_PERIOD		2000		// Sampling period of the measurement (us)
+#define RPIT_SOCKET_MES_PERIOD		50000		// Sampling period of the measurement (us)
 #define RPIT_SOCKET_MAGIC					3141592	// Magic number
 #define RPIT_SOCKET_WATCHDOG_TRIG	1000000	// Delay in us before watchdog is triggered
 
@@ -87,12 +95,12 @@ unsigned char											exit_req = 0;
 
 // Image processing definitions
 
+#ifdef XIM_USE_XIMEA
 #define HandleResult(res,place) if (res!=XI_OK) {flockfile(stderr);fprintf(stderr,"XIAPI: error after %s (%d).\n",place,res);funlockfile(stderr);rpit_socket_cleanup( EXIT_FAILURE );}
-
-#define XIM_LIVE_VIDEO										// Live video on/off
+#endif
 
 #define XIM_XIAPI_BUFFERS		3							// Number of frame buffers
-#define XIM_VIDEO_FSKIP			20						// Live video frame subsampling
+#define XIM_VIDEO_FSKIP			1							// Live video frame subsampling
 #define XIM_EXPOSURE				1800					// us
 #define XIM_TIMEOUT					5000					// ms
 #define XIM_VIDEO_NAME			"Live video"	// Name of the live video window
@@ -116,13 +124,15 @@ unsigned char											exit_req = 0;
 //#define XIM_BLOB_MIN_INER_R	0.01
 //#define XIM_BLOB_MAX_INER_R	0.1
 
+#ifdef XIM_USE_XIMEA
 XI_IMG 												image;
 HANDLE 												xiH = NULL;
 XI_RETURN 										stat = XI_OK;
-IplImage*											cv_image = NULL;
+#else
+CvCapture* 										capture = NULL;
+#endif
 
-using namespace 							cv;
-using namespace 							std;
+IplImage*											cv_image = NULL;
 
 // Cleanup code
 void rpit_socket_cleanup( int exit_code )	{
@@ -133,11 +143,16 @@ void rpit_socket_cleanup( int exit_code )	{
 	
 	if ( cv_image != NULL )
 		cvReleaseImage(	&cv_image	);
-		
+	
+	#ifdef XIM_USE_XIMEA
 	if ( xiH != NULL )	{
 		xiStopAcquisition( xiH );
 		xiCloseDevice( xiH );
 	}
+	#else
+	if ( capture != NULL )
+		cvReleaseCapture( &capture );
+	#endif
 	
 	exit( exit_code );
 }
@@ -197,6 +212,7 @@ int kbhit(void)
   return 0;
 }
 
+#ifdef XIM_USE_XIMEA
 // Compute padding
 int xim_get_padding_x( XI_IMG* xiimg )
 {
@@ -238,6 +254,7 @@ IplImage* xim_xiimg2cvipl( XI_IMG* xiimg )	{
 
 	return cvipl;
 }
+#endif
 
 //
 // MEASUREMENT THREAD. Runs asynchronously at a higher rate.
@@ -271,6 +288,7 @@ void *rpit_socket_server_update( void *ptr )	{
 	
 	// OpenCV initialization
 	
+	#ifdef XIM_USE_XIMEA
 	// Get XIAPI pointer to image
 	cv_image = xim_xiimg2cvipl( &image );
 	if ( cv_image == NULL )	{
@@ -280,7 +298,7 @@ void *rpit_socket_server_update( void *ptr )	{
 		rpit_socket_cleanup( EXIT_FAILURE );
 		return NULL;
 	}
-	cv_mat = cv::cvarrToMat( cv_image );
+	#endif
 
 	// Create video window
 	#ifdef XIM_LIVE_VIDEO
@@ -376,8 +394,19 @@ void *rpit_socket_server_update( void *ptr )	{
 		 */
 			
 		// Getting image from camera
+		#ifdef XIM_USE_XIMEA
 		stat = xiGetImage( xiH, XIM_TIMEOUT, &image );
 		HandleResult( stat, "xiGetImage" );
+		#else
+		cv_image = cvQueryFrame( capture );
+	
+		if ( !cv_image )	{
+			flockfile( stderr );
+			fprintf( stderr,"OpenCV: unable to grab frame (cvQueryFrame).\n" );
+			funlockfile( stderr );
+			rpit_socket_cleanup( EXIT_FAILURE );
+		}
+		#endif
 		
 		// Enter critical section
 	
@@ -393,8 +422,13 @@ void *rpit_socket_server_update( void *ptr )	{
 		try	{
 
 			// Update CV image
+			#ifdef XIM_USE_XIMEA
 			cv_image->imageData=(char*)image.bp;
 			cv_mat = cv::cvarrToMat( cv_image );
+			#else
+			Mat v4l_img = cv_image;
+			cv::cvtColor( v4l_img, cv_mat, CV_BGR2GRAY );
+			#endif
 
 			// Detect blobs only if needed (takes time)
 			if ( !detected )
@@ -630,6 +664,8 @@ int main( int argc, char* argv[] )
 	struct RPIt_socket_mes_struct		local_mes;
 	struct RPIt_socket_con_struct		local_con;
 	
+	#ifdef XIM_USE_XIMEA
+	
 	/* 
 	 * 
 	 * 
@@ -668,6 +704,38 @@ int main( int argc, char* argv[] )
 	// Get first image to detect format
 	stat = xiGetImage( xiH, XIM_TIMEOUT, &image );
 	HandleResult( stat, "xiGetImage" );
+	#else
+	
+	/* 
+	 * 
+	 * 
+	 * OpenCV video capture initialization
+	 * 
+	 * 
+	 * 
+	 */
+	
+	// Open default camera 
+	capture = cvCaptureFromCAM( 0 );
+	
+	if ( !capture )	{
+		flockfile( stderr );
+		fprintf( stderr,"OpenCV: unable to open default capture device (cvCaptureFromCAM).\n" );
+		funlockfile( stderr );
+		rpit_socket_cleanup( EXIT_FAILURE );
+	}
+	
+	// Get first image
+	cv_image = cvQueryFrame( capture );
+	
+	if ( !cv_image )	{
+		flockfile( stderr );
+		fprintf( stderr,"OpenCV: unable to grab frame (cvQueryFrame).\n" );
+		funlockfile( stderr );
+		rpit_socket_cleanup( EXIT_FAILURE );
+	}
+	
+	#endif
 
 	/**********************************************/
 	
