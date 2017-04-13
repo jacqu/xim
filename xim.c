@@ -26,7 +26,7 @@
 //
 // JG, 30.03.17
 
-#define XIM_OPENCV_VER3										// Set this flag to compile with OpenCV 3.x
+//#define XIM_OPENCV_VER3										// Set this flag to compile with OpenCV 3.x
 #define XIM_LIVE_VIDEO										// Live video on/off
 
 #include <stdio.h>
@@ -100,7 +100,7 @@ unsigned char											exit_req = 0;
 #endif
 
 #define XIM_XIAPI_BUFFERS		3							// Number of frame buffers
-#define XIM_VIDEO_FSKIP			1							// Live video frame subsampling
+#define XIM_VIDEO_FSKIP			20						// Live video frame subsampling
 #define XIM_EXPOSURE				1800					// us
 #define XIM_TIMEOUT					5000					// ms
 #define XIM_VIDEO_NAME			"Live video"	// Name of the live video window
