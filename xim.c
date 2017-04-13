@@ -141,9 +141,6 @@ void rpit_socket_cleanup( int exit_code )	{
 	destroyWindow( XIM_VIDEO_NAME );
 	#endif
 	
-	if ( cv_image != NULL )
-		cvReleaseImage(	&cv_image	);
-	
 	#ifdef XIM_USE_XIMEA
 	if ( xiH != NULL )	{
 		xiStopAcquisition( xiH );
@@ -152,6 +149,11 @@ void rpit_socket_cleanup( int exit_code )	{
 	#else
 	if ( capture != NULL )
 		cvReleaseCapture( &capture );
+	#endif
+	
+	#ifdef XIM_USE_XIMEA
+	if ( cv_image != NULL )
+		ReleaseImageHeader(	&cv_image	);
 	#endif
 	
 	exit( exit_code );
