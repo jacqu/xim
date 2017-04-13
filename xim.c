@@ -424,11 +424,17 @@ void *rpit_socket_server_update( void *ptr )	{
 			// Update CV image
 			#ifdef XIM_USE_XIMEA
 			cv_image->imageData=(char*)image.bp;
-			cv_mat = cv::cvarrToMat( cv_image );
-			#else
-			Mat v4l_img = cv_image;
-			cv::cvtColor( v4l_img, cv_mat, CV_BGR2GRAY );
 			#endif
+			
+			// Convert to Mat and to B&W if needed
+			if ( cv_image->nChannels == 1 )	{
+				cv_mat = cv::cvarrToMat( cv_image );
+			}
+			else
+			{
+				Mat col_Mat = cv_image;
+				cv::cvtColor( col_Mat, cv_mat, CV_BGR2GRAY );
+			}
 
 			// Detect blobs only if needed (takes time)
 			if ( !detected )
@@ -724,6 +730,10 @@ int main( int argc, char* argv[] )
 		funlockfile( stderr );
 		rpit_socket_cleanup( EXIT_FAILURE );
 	}
+	
+	// Change acquisition parameters
+	cvSetCaptureProperty( capture, CV_CAP_PROP_FRAME_WIDTH, 320.0 );
+	cvSetCaptureProperty( capture, CV_CAP_PROP_FRAME_HEIGHT, 240.0 );
 	
 	// Get first image
 	cv_image = cvQueryFrame( capture );
