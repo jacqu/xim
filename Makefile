@@ -1,1 +1,1 @@
-Makefile.opencv
+Makefile.ximea

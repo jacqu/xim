@@ -26,7 +26,7 @@
 //
 // JG, 30.03.17
 
-//#define XIM_OPENCV_VER3										// Set this flag to compile with OpenCV 3.x
+#define XIM_OPENCV_VER3										// Set this flag to compile with OpenCV 3.x
 #define XIM_LIVE_VIDEO										// Live video on/off
 
 #include <stdio.h>
@@ -71,7 +71,7 @@ using namespace 							std;
 #define RPIT_SOCKET_CON_N					10			// Nb of double sent (control)
 #define RPIT_SOCKET_MES_N					10			// Nb of double returned (measurement)
 #define RPIT_SOCKET_PORT					"31415"	// Port of the server
-#define RPIT_SOCKET_MES_PERIOD		50000		// Sampling period of the measurement (us)
+#define RPIT_SOCKET_MES_PERIOD		2000		// Sampling period of the measurement (us)
 #define RPIT_SOCKET_MAGIC					3141592	// Magic number
 #define RPIT_SOCKET_WATCHDOG_TRIG	1000000	// Delay in us before watchdog is triggered
 
@@ -235,13 +235,13 @@ IplImage* xim_xiimg2cvipl( XI_IMG* xiimg )	{
 	// Create new IPl Image according to XI_IMG characteristics
 	switch( xiimg->frm )
 		{
-		case XI_MONO8       : cvipl = cvCreateImage( cvSize( xiimg->width + xim_get_padding_x( xiimg ), xiimg->height ), IPL_DEPTH_8U, 1 ); break;
-		case XI_RAW8        : cvipl = cvCreateImage( cvSize( xiimg->width, xiimg->height ), IPL_DEPTH_8U, 1 ); break;		
+		case XI_MONO8       : cvipl = cvCreateImageHeader( cvSize( xiimg->width + xim_get_padding_x( xiimg ), xiimg->height ), IPL_DEPTH_8U, 1 ); break;
+		case XI_RAW8        : cvipl = cvCreateImageHeader( cvSize( xiimg->width, xiimg->height ), IPL_DEPTH_8U, 1 ); break;		
 		case XI_MONO16      :
-		case XI_RAW16       : cvipl = cvCreateImage( cvSize( xiimg->width, xiimg->height ), IPL_DEPTH_16U, 1 ); break;
+		case XI_RAW16       : cvipl = cvCreateImageHeader( cvSize( xiimg->width, xiimg->height ), IPL_DEPTH_16U, 1 ); break;
 		case XI_RGB24       :
-		case XI_RGB_PLANAR  : cvipl = cvCreateImage( cvSize( xiimg->width, xiimg->height ), IPL_DEPTH_8U, 3 );	break;
-		case XI_RGB32       : cvipl = cvCreateImage( cvSize( xiimg->width, xiimg->height ), IPL_DEPTH_8U, 4 ); break;
+		case XI_RGB_PLANAR  : cvipl = cvCreateImageHeader( cvSize( xiimg->width, xiimg->height ), IPL_DEPTH_8U, 3 );	break;
+		case XI_RGB32       : cvipl = cvCreateImageHeader( cvSize( xiimg->width, xiimg->height ), IPL_DEPTH_8U, 4 ); break;
 		default :
 			flockfile( stderr );
 			fprintf( stderr, "XIAPI: unknown format in xim_xiimg2cvipl.\n" );
@@ -432,7 +432,7 @@ void *rpit_socket_server_update( void *ptr )	{
 			}
 			else
 			{
-				Mat col_Mat = cv_image;
+				Mat col_Mat = cv::cvarrToMat( cv_image );
 				cv::cvtColor( col_Mat, cv_mat, CV_BGR2GRAY );
 			}
 
