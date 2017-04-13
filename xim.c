@@ -1,5 +1,5 @@
 // xim : basic framework to handle XIMEA cameras with RPIt socket block
-// Compilation: make
+// Compilation: make -f Makefile.opencv (V4L camera) or make -f Makefile.ximea (XIMEA camera)
 // OpenCV and XIAPI should be installed.
 // Performance tuning:
 //	- Force cpu performance mode:
