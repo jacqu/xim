@@ -26,7 +26,7 @@
 //
 // JG, 30.03.17
 
-//#define XIM_OPENCV_VER3										// Set this flag to compile with OpenCV 3.x
+#define XIM_OPENCV_VER3										// Set this flag to compile with OpenCV 3.x
 #define XIM_LIVE_VIDEO										// Live video on/off
 
 #include <stdio.h>
@@ -153,7 +153,7 @@ void rpit_socket_cleanup( int exit_code )	{
 	
 	#ifdef XIM_USE_XIMEA
 	if ( cv_image != NULL )
-		ReleaseImageHeader(	&cv_image	);
+		cvReleaseImageHeader(	&cv_image	);
 	#endif
 	
 	exit( exit_code );
